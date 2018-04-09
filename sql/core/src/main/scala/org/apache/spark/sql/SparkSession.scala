@@ -32,12 +32,12 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.scheduler.{SparkListener, SparkListenerApplicationEnd}
 import org.apache.spark.sql.catalog.Catalog
 import org.apache.spark.sql.catalyst._
+import org.apache.spark.sql.catalyst.analysis.UnresolvedRelation
 import org.apache.spark.sql.catalyst.encoders._
 import org.apache.spark.sql.catalyst.expressions.AttributeReference
 import org.apache.spark.sql.catalyst.plans.logical.{LocalRelation, Range}
 import org.apache.spark.sql.execution._
 import org.apache.spark.sql.execution.datasources.LogicalRelation
-import org.apache.spark.sql.execution.ui.SQLListener
 import org.apache.spark.sql.internal._
 import org.apache.spark.sql.internal.StaticSQLConf.CATALOG_IMPLEMENTATION
 import org.apache.spark.sql.sources.BaseRelation
@@ -621,7 +621,7 @@ class SparkSession private(
   }
 
   private[sql] def table(tableIdent: TableIdentifier): DataFrame = {
-    Dataset.ofRows(self, sessionState.catalog.lookupRelation(tableIdent))
+    Dataset.ofRows(self, UnresolvedRelation(tableIdent))
   }
 
   /* ----------------- *
@@ -742,7 +742,10 @@ class SparkSession private(
   private[sql] def applySchemaToPythonRDD(
       rdd: RDD[Array[Any]],
       schema: StructType): DataFrame = {
-    val rowRdd = rdd.map(r => python.EvaluatePython.fromJava(r, schema).asInstanceOf[InternalRow])
+    val rowRdd = rdd.mapPartitions { iter =>
+      val fromJava = python.EvaluatePython.makeFromJava(schema)
+      iter.map(r => fromJava(r).asInstanceOf[InternalRow])
+    }
     internalCreateDataFrame(rowRdd, schema)
   }
 
@@ -948,7 +951,8 @@ object SparkSession {
 
         session = new SparkSession(sparkContext, None, None, extensions)
         options.foreach { case (k, v) => session.initialSessionOptions.put(k, v) }
-        defaultSession.set(session)
+        setDefaultSession(session)
+        setActiveSession(session)
 
         // Register a successfully instantiated context to the singleton. This should be at the
         // end of the class definition so that the singleton is updated only if there is no
@@ -956,7 +960,6 @@ object SparkSession {
         sparkContext.addSparkListener(new SparkListener {
           override def onApplicationEnd(applicationEnd: SparkListenerApplicationEnd): Unit = {
             defaultSession.set(null)
-            sqlListener.set(null)
           }
         })
       }
@@ -1025,8 +1028,16 @@ object SparkSession {
    */
   def getDefaultSession: Option[SparkSession] = Option(defaultSession.get)
 
-  /** A global SQL listener used for the SQL UI. */
-  private[sql] val sqlListener = new AtomicReference[SQLListener]()
+  /**
+   * Returns the currently active SparkSession, otherwise the default one. If there is no default
+   * SparkSession, throws an exception.
+   *
+   * @since 2.4.0
+   */
+  def active: SparkSession = {
+    getActiveSession.getOrElse(getDefaultSession.getOrElse(
+      throw new IllegalStateException("No active or default Spark session found")))
+  }
 
   ////////////////////////////////////////////////////////////////////////////////////////
   // Private methods from now on
